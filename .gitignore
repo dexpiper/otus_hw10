@@ -1,0 +1,8 @@
+# homework task
+misc/
+
+# venv
+env/
+
+# logs
+*.log
