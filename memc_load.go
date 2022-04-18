@@ -3,18 +3,27 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io/fs"
+	"io/ioutil"
 	"os"
+	"regexp"
+	"strings"
 
-	log "github.com/sirupsen/logrus" // logging
+	log "github.com/sirupsen/logrus"
 )
 
 func processLog(device_memc map[string]string, pattern string, dry bool) {
-	// main logic
+
 	results := map[string]int{
 		"processed": 0,
 		"errors":    0,
 	}
-	log.Info("Processing")
+	log.Info("Processing...")
+	files, err := getFiles(pattern)
+	if err != nil {
+		log.Error("Failed to find any files to parse")
+	}
+	results["processed"] = len(files)
 	log.Info(
 		fmt.Sprintf(
 			"Total processed: %d; Total errors: %d",
@@ -24,6 +33,32 @@ func processLog(device_memc map[string]string, pattern string, dry bool) {
 	log.Info("Exiting")
 }
 
+// Iterate over <dir> in given pattern and return all files
+// matching <pattern>:
+// 	Usage:
+// 		files, err = getFiles("/misc/tarz/.*.tar.gz")
+func getFiles(pattern string) ([]fs.FileInfo, error) {
+	s := strings.Split(pattern, "/")
+	file_pattern := s[len(s)-1]
+	dir := strings.Join(s[:len(s)-1], "/")
+
+	var matched_files []fs.FileInfo
+	var validFile = regexp.MustCompile(file_pattern)
+
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		log.Error(err)
+		return matched_files, err
+	}
+	for _, f := range files {
+		if validFile.MatchString(f.Name()) {
+			matched_files = append(matched_files, f)
+		}
+	}
+	return matched_files, nil
+}
+
+// Initiate logging settings using given <settings> map
 func setLogging(settings map[string]string) {
 
 	// settings log output
@@ -55,7 +90,7 @@ func getDefaultPattern() string {
 	if default_dict == "" {
 		default_dict = "."
 	}
-	default_pattern := fmt.Sprintf("%s/*.tsv.gz", default_dict)
+	default_pattern := fmt.Sprintf("%s/.*.tsv.gz", default_dict)
 	return default_pattern
 }
 
@@ -71,11 +106,13 @@ func main() {
 	dry := flag.Bool("dry", false, "turn in dryrun (without actual memcaching)")
 	flag.Parse()
 
+	// set logging
 	logset := make(map[string]string)
 	logset["logfile"] = *logfile
 	logset["loglevel"] = *loglevel
 	setLogging(logset)
 
+	// pack all device_memc addresses into a map
 	device_memc := make(map[string]string)
 	device_memc["idfa"] = *idfa
 	device_memc["gaid"] = *gaid
