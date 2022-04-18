@@ -22,6 +22,7 @@ func processLog(device_memc map[string]string, pattern string, dry bool) {
 	files, err := getFiles(pattern)
 	if err != nil {
 		log.Error("Failed to find any files to parse")
+		os.Exit(1)
 	}
 	results["processed"] = len(files)
 	log.Info(
@@ -40,6 +41,11 @@ func processLog(device_memc map[string]string, pattern string, dry bool) {
 func getFiles(pattern string) ([]fs.FileInfo, error) {
 	s := strings.Split(pattern, "/")
 	file_pattern := s[len(s)-1]
+	if file_pattern == "" {
+		log.Warning(
+			"File pattern is a bare directory without actual pattern: ", pattern)
+		log.Warning("All files in dir would be processed")
+	}
 	dir := strings.Join(s[:len(s)-1], "/")
 
 	var matched_files []fs.FileInfo
@@ -51,7 +57,8 @@ func getFiles(pattern string) ([]fs.FileInfo, error) {
 		return matched_files, err
 	}
 	for _, f := range files {
-		if validFile.MatchString(f.Name()) {
+		// list only files matching pattern, check out any folders
+		if validFile.MatchString(f.Name()) && !f.IsDir() {
 			matched_files = append(matched_files, f)
 		}
 	}
