@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/golang/protobuf/proto"
 	log "github.com/sirupsen/logrus"
 )
@@ -23,12 +24,8 @@ type AppsInstalled struct {
 	apps     []uint64
 }
 
-func processLog(device_memc map[string]string, pattern string, dry bool) {
-
-	results := map[string]int{
-		"processed": 0,
-		"errors":    0,
-	}
+func processLog(device_memc map[string]string,
+	pattern string, dry bool, normal_err_rate float64) {
 
 	log.Info("Processing...")
 	files, dir, err := getFiles(pattern)
@@ -41,13 +38,23 @@ func processLog(device_memc map[string]string, pattern string, dry bool) {
 		os.Exit(0)
 	}
 
+	memc_pool := getMemcPool(device_memc)
+
 	for _, f := range files {
+
+		// a map with results for each file
+		results := map[string]int{
+			"processed": 0,
+			"errors":    0,
+		}
+
 		fd, err := os.Open(fmt.Sprintf("%s/%s", dir, f.Name()))
 		if err != nil {
 			log.Error(fmt.Sprintf("Cannot open file %s. Error: %s", f.Name(), err))
 		}
-		scanner := bufio.NewScanner(fd)
 
+		// iterating over each string in file
+		scanner := bufio.NewScanner(fd)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			appsinstalled, err := parseAppinstalled(line)
@@ -56,26 +63,47 @@ func processLog(device_memc map[string]string, pattern string, dry bool) {
 				results["errors"]++
 			} else {
 				address := device_memc[appsinstalled.dev_type]
-				insertAppsinstalled(appsinstalled, address, dry)
-				results["processed"]++
+				memc := memc_pool[appsinstalled.dev_type]
+				err := insertAppsinstalled(appsinstalled, memc, address, dry)
+				if err != nil {
+					results["errors"]++
+				} else {
+					results["processed"]++
+				}
 			}
 		}
 
+		var err_rate float64
+		errs := results["errors"]
+		processed := results["processed"]
+		if processed != 0 {
+			err_rate = float64(errs) / float64(processed)
+		} else {
+			err_rate = 1.0
+		}
+		if err_rate >= normal_err_rate {
+			log.Error(fmt.Sprintf(
+				"High error rate (%.2f > %v). Failed load", err_rate, normal_err_rate))
+		} else {
+			log.Info(
+				fmt.Sprintf(
+					"Successful load. Total processed: %d; Total errors: %d",
+					processed,
+					errs,
+				))
+		}
 		fd.Close()
 	}
 
-	// results["processed"] = len(files)
-	log.Info(
-		fmt.Sprintf(
-			"Total processed: %d; Total errors: %d",
-			results["processed"],
-			results["errors"],
-		))
+	// TODO: renaming file
 	log.Info("Exiting")
 }
 
 // Writing to memcache (or to log) parsed apps
-func insertAppsinstalled(appsinstalled AppsInstalled, address string, dry bool) {
+func insertAppsinstalled(
+	appsinstalled AppsInstalled,
+	memc *memcache.Client,
+	address string, dry bool) error {
 
 	uapps := &UserApps{}
 	uapps.Lat = appsinstalled.lat
@@ -90,16 +118,33 @@ func insertAppsinstalled(appsinstalled AppsInstalled, address string, dry bool) 
 	key := fmt.Sprintf("%s:%s", appsinstalled.dev_type, appsinstalled.dev_id)
 
 	if dry {
+
+		// pretending that we write into memc
 		var apps []string
 		for _, i := range uapps.GetApps() {
 			apps = append(apps, strconv.FormatUint(i, 10))
 		}
 		log.Debug(
 			fmt.Sprintf("%s - %s -> %s", address, key, strings.Join(apps, " ")))
+		return nil
 	} else {
-		// TODO: memc real writer
-		log.Debug(
-			fmt.Sprintf("Writing to memc %s key %s this string: %s", address, key, out))
+
+		// actually writing to memc with given memc Client
+		// TODO: retry
+		err := memc.Set(&memcache.Item{
+			Key:   key,
+			Value: out,
+		})
+		if err != nil {
+			log.Error(
+				fmt.Sprintf(
+					"Cannot write to memc %s key %s. Error: %s", address, key, err))
+			return memcache.ErrServerError
+		} else {
+			log.Debug(
+				fmt.Sprintf("Writing to memc server %s: key %s", address, key))
+			return nil
+		}
 	}
 }
 
@@ -132,6 +177,16 @@ func parseAppinstalled(line string) (AppsInstalled, error) {
 		return AppsInstalled{}, fmt.Errorf("Cannot parse apps: %s", line)
 	}
 	return AppsInstalled{dev_type, dev_id, lat, lon, apps}, nil
+}
+
+// get a map of memcached clients for each device type
+func getMemcPool(device_memc map[string]string) map[string]*memcache.Client {
+	pool := make(map[string]*memcache.Client)
+	for device_name, addr := range device_memc {
+		cl := memcache.New(addr)
+		pool[device_name] = cl
+	}
+	return pool
 }
 
 // Iterate over <dir> in given pattern and return all files
@@ -214,6 +269,8 @@ func main() {
 	dvid := flag.String("dvid", "127.0.0.1:33016", "dvid address")
 	pattern := flag.String("pattern", getDefaultPattern(), "example: <dir>/*.tsv.gz")
 	dry := flag.Bool("dry", false, "turn in dryrun (without actual memcaching)")
+	err_rate := flag.Float64(
+		"err_rate", 0.01, "Use float64 for defining acceptable error rate")
 	flag.Parse()
 
 	// set logging
@@ -230,16 +287,17 @@ func main() {
 	device_memc["dvid"] = *dvid
 
 	log.WithFields(log.Fields{
-		"loglevel": *loglevel,
-		"logfile":  *logfile,
-		"idfa":     *idfa,
-		"gaid":     *gaid,
-		"adid":     *adid,
-		"dvid":     *dvid,
-		"dry":      *dry,
-		"pattern":  *pattern,
+		"loglevel":   *loglevel,
+		"logfile":    *logfile,
+		"idfa":       *idfa,
+		"gaid":       *gaid,
+		"adid":       *adid,
+		"dvid":       *dvid,
+		"dry":        *dry,
+		"pattern":    *pattern,
+		"error_rate": *err_rate,
 	}).Info("Starting the application")
 
-	processLog(device_memc, *pattern, *dry)
+	processLog(device_memc, *pattern, *dry, *err_rate)
 
 }
