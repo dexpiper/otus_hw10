@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"compress/gzip"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -53,8 +54,13 @@ func processLog(device_memc map[string]string,
 			log.Error(fmt.Sprintf("Cannot open file %s. Error: %s", f.Name(), err))
 		}
 
+		fz, err := gzip.NewReader(fd)
+		if err != nil {
+			log.Error(fmt.Sprintf("Cannot gunzip file %s. Error: %s", f.Name(), err))
+		}
+
 		// iterating over each string in file
-		scanner := bufio.NewScanner(fd)
+		scanner := bufio.NewScanner(fz)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			appsinstalled, err := parseAppinstalled(line)
@@ -92,6 +98,7 @@ func processLog(device_memc map[string]string,
 					errs,
 				))
 		}
+		fz.Close()
 		fd.Close()
 	}
 
