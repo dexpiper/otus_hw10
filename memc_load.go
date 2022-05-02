@@ -1,16 +1,27 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io/fs"
 	"io/ioutil"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/golang/protobuf/proto"
 	log "github.com/sirupsen/logrus"
 )
+
+type AppsInstalled struct {
+	dev_type string
+	dev_id   string
+	lat      float64
+	lon      float64
+	apps     []uint64
+}
 
 func processLog(device_memc map[string]string, pattern string, dry bool) {
 
@@ -20,7 +31,7 @@ func processLog(device_memc map[string]string, pattern string, dry bool) {
 	}
 
 	log.Info("Processing...")
-	files, err := getFiles(pattern)
+	files, dir, err := getFiles(pattern)
 	if err != nil {
 		log.Error("Failed to get files to parse")
 		os.Exit(1)
@@ -30,7 +41,30 @@ func processLog(device_memc map[string]string, pattern string, dry bool) {
 		os.Exit(0)
 	}
 
-	results["processed"] = len(files)
+	for _, f := range files {
+		fd, err := os.Open(fmt.Sprintf("%s/%s", dir, f.Name()))
+		if err != nil {
+			log.Error(fmt.Sprintf("Cannot open file %s. Error: %s", f.Name(), err))
+		}
+		scanner := bufio.NewScanner(fd)
+
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			appsinstalled, err := parseAppinstalled(line)
+			if err != nil {
+				log.Debug(err)
+				results["errors"]++
+			} else {
+				address := device_memc[appsinstalled.dev_type]
+				insertAppsinstalled(appsinstalled, address, dry)
+				results["processed"]++
+			}
+		}
+
+		fd.Close()
+	}
+
+	// results["processed"] = len(files)
 	log.Info(
 		fmt.Sprintf(
 			"Total processed: %d; Total errors: %d",
@@ -40,11 +74,71 @@ func processLog(device_memc map[string]string, pattern string, dry bool) {
 	log.Info("Exiting")
 }
 
+// Writing to memcache (or to log) parsed apps
+func insertAppsinstalled(appsinstalled AppsInstalled, address string, dry bool) {
+
+	uapps := &UserApps{}
+	uapps.Lat = appsinstalled.lat
+	uapps.Lon = appsinstalled.lon
+	uapps.Apps = appsinstalled.apps
+
+	out, err := proto.Marshal(uapps)
+	if err != nil {
+		log.Error("Failed to encode user apps:", err)
+	}
+
+	key := fmt.Sprintf("%s:%s", appsinstalled.dev_type, appsinstalled.dev_id)
+
+	if dry {
+		var apps []string
+		for _, i := range uapps.GetApps() {
+			apps = append(apps, strconv.FormatUint(i, 10))
+		}
+		log.Debug(
+			fmt.Sprintf("%s - %s -> %s", address, key, strings.Join(apps, " ")))
+	} else {
+		// TODO: memc real writer
+		log.Debug(
+			fmt.Sprintf("Writing to memc %s key %s this string: %s", address, key, out))
+	}
+}
+
+// Parse one line of logs file and return struct AppsInstalled
+func parseAppinstalled(line string) (AppsInstalled, error) {
+	line = strings.TrimSpace(line)
+	prts := strings.Split(line, "\t")
+	if len(prts) != 5 {
+		log.Info("Cannot parse line: %s", line)
+		return AppsInstalled{}, fmt.Errorf("Cannot parse line: %s", line)
+	}
+	dev_type, dev_id := prts[0], prts[1]
+	lat, errlat := strconv.ParseFloat(prts[2], 2)
+	lon, errlon := strconv.ParseFloat(prts[3], 2)
+	if errlat != nil || errlon != nil {
+		log.Info("Cannot parse geocoords: %s", line)
+		return AppsInstalled{}, fmt.Errorf("Cannot parse geocoords: %s", line)
+	}
+	raw_apps := strings.Split(prts[4], ",")
+	var apps []uint64
+	for _, raw_app := range raw_apps {
+		raw_app := strings.TrimSpace(raw_app)
+		app, err := strconv.ParseUint(raw_app, 0, 64)
+		if err == nil {
+			apps = append(apps, app)
+		}
+	}
+	if len(apps) == 0 {
+		log.Info("Cannot parse apps: %s", line)
+		return AppsInstalled{}, fmt.Errorf("Cannot parse apps: %s", line)
+	}
+	return AppsInstalled{dev_type, dev_id, lat, lon, apps}, nil
+}
+
 // Iterate over <dir> in given pattern and return all files
 // matching <pattern>:
 // 	Usage:
 // 		files, err = getFiles("/misc/tarz/.*.tar.gz")
-func getFiles(pattern string) ([]fs.FileInfo, error) {
+func getFiles(pattern string) ([]fs.FileInfo, string, error) {
 	s := strings.Split(pattern, "/")
 	file_pattern := s[len(s)-1]
 	if file_pattern == "" {
@@ -60,18 +154,18 @@ func getFiles(pattern string) ([]fs.FileInfo, error) {
 	files, err := ioutil.ReadDir(dir)
 	if err != nil {
 		log.Error(err)
-		return matched_files, err
+		return matched_files, dir, err
 	}
 	for _, f := range files {
 		// list only files matching pattern, check out any folders
 		if validFile.MatchString(f.Name()) &&
 			!f.IsDir() &&
-			strings.HasPrefix(f.Name(), ".") {
+			!strings.HasPrefix(f.Name(), ".") {
 			matched_files = append(matched_files, f)
 		}
 	}
 
-	return matched_files, nil
+	return matched_files, dir, nil
 }
 
 // Initiate logging settings using given <settings> map
@@ -102,11 +196,11 @@ func setLogging(settings map[string]string) {
 }
 
 func getDefaultPattern() string {
-	default_dict := os.Getenv("default_dict")
-	if default_dict == "" {
-		default_dict = "."
+	default_dir := os.Getenv("default_dir")
+	if default_dir == "" {
+		default_dir = "."
 	}
-	default_pattern := fmt.Sprintf("%s/.*.tsv.gz", default_dict)
+	default_pattern := fmt.Sprintf("%s/.*.tsv.gz", default_dir)
 	return default_pattern
 }
 
