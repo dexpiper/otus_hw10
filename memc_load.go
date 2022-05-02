@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/golang/protobuf/proto"
@@ -383,6 +384,7 @@ func main() {
 		"workers":    *workers,
 	}).Info("Starting the application")
 
+	start := time.Now()
 	processLog(StartOptions{device_memc, pattern, dry, err_rate, workers})
-
+	log.Info(fmt.Sprintf("Execution time: %s", time.Since(start)))
 }
