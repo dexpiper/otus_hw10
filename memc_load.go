@@ -11,25 +11,74 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/golang/protobuf/proto"
 	log "github.com/sirupsen/logrus"
 )
 
-type AppsInstalled struct {
-	dev_type string
-	dev_id   string
-	lat      float64
-	lon      float64
-	apps     []uint64
+type StartOptions struct {
+	Device_memc map[string]string
+	Pattern     *string
+	Dry         *bool
+	Err_rate    *float64
+	Workers     *int
 }
 
-func processLog(device_memc map[string]string,
-	pattern string, dry bool, normal_err_rate float64) {
+type AppsInstalled struct {
+	Dev_type string
+	Dev_id   string
+	Lat      float64
+	Lon      float64
+	Apps     []uint64
+}
 
-	log.Info("Processing...")
-	files, dir, err := getFiles(pattern)
+type Job struct {
+	Appsinstalled AppsInstalled
+	Memc          *memcache.Client
+	Address       string
+	Dry           bool
+	Err           error
+}
+
+var wg sync.WaitGroup
+
+// consume Job from jobs chan, do the Job,
+// than write any errors into resulting <err> chan
+func consume(jobs <-chan *Job, errs chan<- *Job) {
+	defer wg.Done()
+	for job := range jobs {
+		err := insertAppsinstalled(
+			job.Appsinstalled, job.Memc, job.Address, job.Dry)
+		job.Err = err
+		errs <- job
+	}
+}
+
+// calculating job results: taking ready Job from chan
+// and fill in results_map
+func analyze(jobs <-chan *Job, result chan<- map[string]int) {
+	results_map := map[string]int{
+		"processed": 0,
+		"errors":    0,
+	}
+	for job := range jobs {
+
+		if job.Err != nil {
+			results_map["errors"]++
+		} else {
+			results_map["processed"]++
+		}
+	}
+	// single result
+	result <- results_map
+}
+
+func processLog(opts StartOptions) {
+
+	log.Info("Starting...")
+	files, dir, err := getFiles(*opts.Pattern)
 	if err != nil {
 		log.Error("Failed to get files to parse")
 		os.Exit(1)
@@ -39,16 +88,26 @@ func processLog(device_memc map[string]string,
 		os.Exit(0)
 	}
 
-	memc_pool := getMemcPool(device_memc)
+	log.Info(fmt.Sprintf("Found total %v files in %s", len(files), dir))
+	memc_pool := getMemcPool(opts.Device_memc)
 
 	for _, f := range files {
 
-		// a map with results for each file
-		results := map[string]int{
-			"processed": 0,
-			"errors":    0,
+		// initializing chans
+		jobs := make(chan *Job, 100)        // Buffered channel
+		errs := make(chan *Job, 100)        // Buffered channel
+		result := make(chan map[string]int) // Unbuffered channel
+
+		// starting consumer goroutine
+		for i := 0; i < *opts.Workers; i++ {
+			wg.Add(1)
+			go consume(jobs, errs)
 		}
 
+		// starting analyzer goroutine
+		go analyze(errs, result)
+
+		// opening and un-gunzipping file
 		fd, err := os.Open(fmt.Sprintf("%s/%s", dir, f.Name()))
 		if err != nil {
 			log.Error(fmt.Sprintf("Cannot open file %s. Error: %s", f.Name(), err))
@@ -66,36 +125,53 @@ func processLog(device_memc map[string]string,
 			appsinstalled, err := parseAppinstalled(line)
 			if err != nil {
 				log.Debug(err)
-				results["errors"]++
+				errs <- &Job{Err: err}
 			} else {
-				address := device_memc[appsinstalled.dev_type]
-				memc := memc_pool[appsinstalled.dev_type]
-				err := insertAppsinstalled(appsinstalled, memc, address, dry)
-				if err != nil {
-					results["errors"]++
-				} else {
-					results["processed"]++
+				address := opts.Device_memc[appsinstalled.Dev_type]
+				memc := memc_pool[appsinstalled.Dev_type]
+
+				// scheduling Job
+				jobs <- &Job{
+					Appsinstalled: appsinstalled,
+					Memc:          memc,
+					Address:       address,
+					Dry:           *opts.Dry,
+					Err:           nil,
 				}
 			}
 		}
 
+		close(jobs)
+		log.Info(fmt.Sprintf("Processing file %s ...", f.Name()))
+		wg.Wait()
+
+		close(errs)
+		log.Debug(fmt.Sprintf(
+			"All jobs for %s are scheduled, waiting for analyzer", f.Name()))
+		results := <-result
+		close(result)
+
+		log.Debug(fmt.Sprintf("All results for %s are analyzed", f.Name()))
+
+		// making final calculations
 		var err_rate float64
-		errs := results["errors"]
+		errors := results["errors"]
 		processed := results["processed"]
 		if processed != 0 {
-			err_rate = float64(errs) / float64(processed)
+			err_rate = float64(errors) / float64(processed)
 		} else {
 			err_rate = 1.0
 		}
-		if err_rate >= normal_err_rate {
+		if err_rate >= *opts.Err_rate {
 			log.Error(fmt.Sprintf(
-				"High error rate (%.2f > %v). Failed load", err_rate, normal_err_rate))
+				"High error rate (%.2f > %v). Failed load", err_rate, *opts.Err_rate))
 		} else {
 			log.Info(
 				fmt.Sprintf(
-					"Successful load. Total processed: %d; Total errors: %d",
+					"Successful load %s. Total processed: %d; Total errors: %d",
+					f.Name(),
 					processed,
-					errs,
+					errors,
 				))
 		}
 		fz.Close()
@@ -113,16 +189,16 @@ func insertAppsinstalled(
 	address string, dry bool) error {
 
 	uapps := &UserApps{}
-	uapps.Lat = appsinstalled.lat
-	uapps.Lon = appsinstalled.lon
-	uapps.Apps = appsinstalled.apps
+	uapps.Lat = appsinstalled.Lat
+	uapps.Lon = appsinstalled.Lon
+	uapps.Apps = appsinstalled.Apps
 
 	out, err := proto.Marshal(uapps)
 	if err != nil {
 		log.Error("Failed to encode user apps:", err)
 	}
 
-	key := fmt.Sprintf("%s:%s", appsinstalled.dev_type, appsinstalled.dev_id)
+	key := fmt.Sprintf("%s:%s", appsinstalled.Dev_type, appsinstalled.Dev_id)
 
 	if dry {
 
@@ -278,6 +354,7 @@ func main() {
 	dry := flag.Bool("dry", false, "turn in dryrun (without actual memcaching)")
 	err_rate := flag.Float64(
 		"err_rate", 0.01, "Use float64 for defining acceptable error rate")
+	workers := flag.Int("workers", 5, "Number of workers (5 by default)")
 	flag.Parse()
 
 	// set logging
@@ -303,8 +380,9 @@ func main() {
 		"dry":        *dry,
 		"pattern":    *pattern,
 		"error_rate": *err_rate,
+		"workers":    *workers,
 	}).Info("Starting the application")
 
-	processLog(device_memc, *pattern, *dry, *err_rate)
+	processLog(StartOptions{device_memc, pattern, dry, err_rate, workers})
 
 }
