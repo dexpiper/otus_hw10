@@ -25,6 +25,7 @@ type StartOptions struct {
 	Dry         *bool
 	Err_rate    *float64
 	Workers     *int
+	Rename      *bool
 }
 
 type AppsInstalled struct {
@@ -109,7 +110,8 @@ func processLog(opts StartOptions) {
 		go analyze(errs, result)
 
 		// opening and un-gunzipping file
-		fd, err := os.Open(fmt.Sprintf("%s/%s", dir, f.Name()))
+		file_path := fmt.Sprintf("%s/%s", dir, f.Name())
+		fd, err := os.Open(file_path)
 		if err != nil {
 			log.Error(fmt.Sprintf("Cannot open file %s. Error: %s", f.Name(), err))
 		}
@@ -177,9 +179,13 @@ func processLog(opts StartOptions) {
 		}
 		fz.Close()
 		fd.Close()
+		if *opts.Rename != false {
+			if err := dotRenameFile(file_path); err == nil {
+				log.Info(fmt.Sprintf("File %s renamed", f.Name()))
+			}
+		}
 	}
 
-	// TODO: renaming file
 	log.Info("Exiting")
 }
 
@@ -343,6 +349,21 @@ func getDefaultPattern() string {
 	return default_pattern
 }
 
+// rename given file (full path required) with a dot + filename:
+// example: myfile.tar.gz -> .myfile.tar.gz
+func dotRenameFile(old_path string) error {
+	s := strings.Split(old_path, "/")
+	filename := s[len(s)-1]
+	dotted_filename := fmt.Sprintf(".%s", filename)
+	s[len(s)-1] = dotted_filename
+	new_path := strings.Join(s, "/")
+	if err := os.Rename(old_path, new_path); err != nil {
+		log.Error(fmt.Sprintf("Cannot rename file %s: Error: %s", old_path, err))
+		return err
+	}
+	return nil
+}
+
 func main() {
 
 	logfile := flag.String("logfile", "stdout", "Logfile name")
@@ -356,6 +377,7 @@ func main() {
 	err_rate := flag.Float64(
 		"err_rate", 0.01, "Use float64 for defining acceptable error rate")
 	workers := flag.Int("workers", 5, "Number of workers (5 by default)")
+	rename := flag.Bool("rename", true, "false to disable renaming processed files")
 	flag.Parse()
 
 	// set logging
@@ -382,9 +404,10 @@ func main() {
 		"pattern":    *pattern,
 		"error_rate": *err_rate,
 		"workers":    *workers,
+		"rename":     *rename,
 	}).Info("Starting the application")
 
 	start := time.Now()
-	processLog(StartOptions{device_memc, pattern, dry, err_rate, workers})
+	processLog(StartOptions{device_memc, pattern, dry, err_rate, workers, rename})
 	log.Info(fmt.Sprintf("Execution time: %s", time.Since(start)))
 }
