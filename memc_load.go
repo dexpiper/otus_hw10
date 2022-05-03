@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"flag"
 	"fmt"
 	"io/fs"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"regexp"
 	"strconv"
@@ -17,6 +19,7 @@ import (
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/golang/protobuf/proto"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/semaphore"
 )
 
 type StartOptions struct {
@@ -45,6 +48,8 @@ type Job struct {
 }
 
 var wg sync.WaitGroup
+var sem = semaphore.NewWeighted(5)
+var ctx = context.TODO()
 
 // consume Job from jobs chan, do the Job,
 // than write any errors into resulting <err> chan
@@ -53,6 +58,9 @@ func consume(jobs <-chan *Job, errs chan<- *Job) {
 	for job := range jobs {
 		err := insertAppsinstalled(
 			job.Appsinstalled, job.Memc, job.Address, job.Dry)
+		if err == memcache.ErrServerError {
+			log.Panicf("Memc server %s is not responding", job.Address)
+		}
 		job.Err = err
 		errs <- job
 	}
@@ -220,15 +228,12 @@ func insertAppsinstalled(
 	} else {
 
 		// actually writing to memc with given memc Client
-		// TODO: retry
-		err := memc.Set(&memcache.Item{
+		err := setReconnect(memc, address, memcache.Item{
 			Key:   key,
 			Value: out,
 		})
 		if err != nil {
-			log.Error(
-				fmt.Sprintf(
-					"Cannot write to memc %s key %s. Error: %s", address, key, err))
+			log.Errorf("Cannot write to memc %s key %s. Error: %s", address, key, err)
 			return memcache.ErrServerError
 		} else {
 			log.Debug(
@@ -236,6 +241,29 @@ func insertAppsinstalled(
 			return nil
 		}
 	}
+}
+
+// set data (key/value pair) into memcache.Client
+// if the Client it is not responding try to reconnect in random intervals
+func setReconnect(memc *memcache.Client, address string, data memcache.Item) error {
+	ctx.Value(address)
+	sem.Acquire(ctx, 1)
+	defer sem.Release(1)
+	if err := memc.Ping(); err != nil {
+		r := rand.New(rand.NewSource(42))
+		for i := 0; i < 3; i++ {
+			log.Warningf("Trying connect to %s, attempt %v", address, i+1)
+			time.Sleep(
+				time.Duration(
+					// wait random time between 0.1 and 1.5 + i/2 seconds
+					float64(r.Intn(15)/10)+float64(i)*100/2) / 100 * time.Second)
+			if err := memc.Ping(); err == nil {
+				ok := memc.Set(&data)
+				return ok
+			}
+		}
+	}
+	return fmt.Errorf("Failed to connect to %s", address)
 }
 
 // Parse one line of logs file and return struct AppsInstalled
