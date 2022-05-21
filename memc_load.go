@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -271,10 +272,19 @@ func setReconnect(memc *memcache.Client, address string, data memcache.Item) err
 		r := rand.New(rand.NewSource(42))
 		for i := 0; i < 3; i++ {
 			log.Warningf("Trying connect to %s, attempt %v", address, i+1)
+
+			cap := 1.5        // maximum amount of time to wait between attempts
+			base := 1.0       // base multiplier factor (exponential rate)
+			temp := math.Min( // minimum between cap and (base*2**i)
+				cap,
+				math.Pow(base*2, float64(i)),
+			)
+			random := r.Float64() * (temp / 2) // random between 0 and temp / 2
+
 			time.Sleep(
-				time.Duration(
-					// wait random time between 0.1 and 1.5 + i/2 seconds
-					float64(r.Intn(15)/10)+float64(i)*100/2) / 100 * time.Second)
+				// Jitter
+				time.Duration(temp/2+random) * time.Second)
+
 			if err := memc.Ping(); err == nil {
 				ok := memc.Set(&data)
 				return ok
