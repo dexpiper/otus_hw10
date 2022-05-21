@@ -26,11 +26,11 @@
 
 ## Example run
 
-`$ go run memc_load --pattern="/home/alex/Downloads/.*.tsv.gz" --loglevel=info --err_rate=0.03 --rename=false --dry`
+`$ go run memc_load --pattern="/home/alex/Downloads/*.tsv.gz" --loglevel=info --err_rate=0.03 --rename=false --dry`
 
 
 ```
-INFO[0000] Starting the application                      adid="127.0.0.1:33015" dry=true dvid="127.0.0.1:33016" error_rate=0.03 gaid="127.0.0.1:33014" idfa="127.0.0.1:33013" logfile=stdout loglevel=info pattern="/home/alex/Downloads/.*.tsv.gz" rename=false workers=5
+INFO[0000] Starting the application                      adid="127.0.0.1:33015" dry=true dvid="127.0.0.1:33016" error_rate=0.03 gaid="127.0.0.1:33014" idfa="127.0.0.1:33013" logfile=stdout loglevel=info pattern="/home/alex/Downloads/*.tsv.gz" rename=false workers=5
 
 INFO[0000] Starting...
 
