@@ -29,25 +29,40 @@
 `$ go run memc_load --pattern="/home/alex/Downloads/.*.tsv.gz" --loglevel=info --err_rate=0.03 --rename=false --dry`
 
 
-`INFO[0000] Starting the application                      adid="127.0.0.1:33015" dry=true dvid="127.0.0.1:33016" error_rate=0.03 gaid="127.0.0.1:33014" idfa="127.0.0.1:33013" logfile=stdout loglevel=info pattern="/home/alex/Downloads/.*.tsv.gz" rename=false workers=5`
+```
+INFO[0000] Starting the application                      adid="127.0.0.1:33015" dry=true dvid="127.0.0.1:33016" error_rate=0.03 gaid="127.0.0.1:33014" idfa="127.0.0.1:33013" logfile=stdout loglevel=info pattern="/home/alex/Downloads/.*.tsv.gz" rename=false workers=5
 
-`INFO[0000] Starting...                                  `
+INFO[0000] Starting...
 
-`INFO[0000] Found total 3 files in /home/alex/Downloads  `
+INFO[0000] Found total 3 files in /home/alex/Downloads
 
-`INFO[0046] Processing file 20170929000000.tsv.gz ...    `
+INFO[0000] File 20170929000000.tsv.gz sheduled for processing
 
-`INFO[0046] Successful load 20170929000000.tsv.gz. Total processed: 3422995; Total errors: 0 `
+INFO[0000] File 20170929000100.tsv.gz sheduled for processing
 
-`INFO[0095] Processing file 20170929000100.tsv.gz ...    `
+INFO[0000] File 20170929000200.tsv.gz sheduled for processing
 
-`INFO[0095] Successful load 20170929000100.tsv.gz. Total processed: 3424477; Total errors: 0 `
+INFO[0000] All 3 files are sheduled.
 
-`INFO[0144] Processing file 20170929000200.tsv.gz ...    `
+INFO[0000] Please wait for fileprocessors done the reading...
 
-`INFO[0144] Successful load 20170929000200.tsv.gz. Total processed: 3422026; Total errors: 0 `
+INFO[0117] File 20170929000200.tsv.gz is read to the end and closed
 
-`INFO[0144] Exiting                                      `
+INFO[0117] File 20170929000000.tsv.gz is read to the end and closed
 
-`INFO[0144] Execution time: 2m24.269689319s`
+INFO[0123] File 20170929000100.tsv.gz is read to the end and closed
+
+INFO[0123] Closing jobs chan
+
+INFO[0123] Waiting for consumers to shut down
+
+INFO[0123] Waiting for analyzer to analyze the results
+
+INFO[0123] Successful load. Total processed: 10269498; Total errors: 0
+
+INFO[0123] Exiting
+
+INFO[0123] Execution time: 2m3.500413335s
+
+```
 

@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
-	"context"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -19,7 +18,6 @@ import (
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/golang/protobuf/proto"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/sync/semaphore"
 )
 
 type StartOptions struct {
@@ -47,13 +45,9 @@ type Job struct {
 	Err           error
 }
 
-var wg sync.WaitGroup
-var sem = semaphore.NewWeighted(5)
-var ctx = context.TODO()
-
 // consume Job from jobs chan, do the Job,
 // than write any errors into resulting <err> chan
-func consume(jobs <-chan *Job, errs chan<- *Job) {
+func consume(jobs <-chan *Job, errs chan<- *Job, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for job := range jobs {
 		err := insertAppsinstalled(
@@ -68,7 +62,7 @@ func consume(jobs <-chan *Job, errs chan<- *Job) {
 
 // calculating job results: taking ready Job from chan
 // and fill in results_map
-func analyze(jobs <-chan *Job, result chan<- map[string]int) {
+func analyze(jobs <-chan *Job, results chan<- map[string]int) {
 	results_map := map[string]int{
 		"processed": 0,
 		"errors":    0,
@@ -81,8 +75,59 @@ func analyze(jobs <-chan *Job, result chan<- map[string]int) {
 			results_map["processed"]++
 		}
 	}
-	// single result
-	result <- results_map
+
+	results <- results_map
+}
+
+func processFile(
+	f fs.FileInfo,
+	dir string,
+	jobs chan<- *Job,
+	errs chan<- *Job,
+	memc_pool map[string]*memcache.Client,
+	opts StartOptions,
+	wg *sync.WaitGroup,
+) {
+
+	defer wg.Done()
+	defer log.Infof("File %s is read to the end and closed", f.Name())
+
+	// opening and un-gunzipping file
+	file_path := fmt.Sprintf("%s/%s", dir, f.Name())
+	fd, err := os.Open(file_path)
+	if err != nil {
+		log.Errorf("Cannot open file %s. Error: %s", f.Name(), err)
+	}
+	defer fd.Close()
+
+	fz, err := gzip.NewReader(fd)
+	if err != nil {
+		log.Errorf("Cannot gunzip file %s. Error: %s", f.Name(), err)
+	}
+	defer fz.Close()
+
+	// iterating over each string in file
+	scanner := bufio.NewScanner(fz)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		appsinstalled, err := parseAppinstalled(line)
+		if err != nil {
+			log.Debug(err)
+			errs <- &Job{Err: err}
+		} else {
+			address := opts.Device_memc[appsinstalled.Dev_type]
+			memc := memc_pool[appsinstalled.Dev_type]
+
+			// scheduling Job
+			jobs <- &Job{
+				Appsinstalled: appsinstalled,
+				Memc:          memc,
+				Address:       address,
+				Dry:           *opts.Dry,
+				Err:           nil,
+			}
+		}
+	}
 }
 
 func processLog(opts StartOptions) {
@@ -101,92 +146,69 @@ func processLog(opts StartOptions) {
 	log.Info(fmt.Sprintf("Found total %v files in %s", len(files), dir))
 	memc_pool := getMemcPool(opts.Device_memc)
 
+	// initializing chans
+	jobs := make(chan *Job, 100)         // Buffered channel
+	errs := make(chan *Job, 100)         // Buffered channel
+	results := make(chan map[string]int) // Unbuffered channel
+	var consumer_wg sync.WaitGroup
+	var fileprocessor_wg sync.WaitGroup
+
+	// starting consumer goroutine
+	for i := 0; i < *opts.Workers; i++ {
+		consumer_wg.Add(1)
+		go consume(jobs, errs, &consumer_wg)
+	}
+
+	go analyze(errs, results)
+
+	for _, f := range files {
+		fileprocessor_wg.Add(1)
+		go processFile(f, dir, jobs, errs, memc_pool, opts, &fileprocessor_wg)
+		log.Info(fmt.Sprintf("File %s sheduled for processing", f.Name()))
+	}
+
+	log.Infof("All %v files are sheduled.", len(files))
+	log.Infof("Please wait for fileprocessors done the reading...")
+	fileprocessor_wg.Wait()
+
+	log.Infof("Closing jobs chan")
+	close(jobs)
+
+	log.Infof("Waiting for consumers to shut down")
+	consumer_wg.Wait()
+	close(errs)
+
+	log.Infof("Waiting for analyzer to analyze the results")
+	processing_results := <-results
+	close(results)
+	log.Debug("All results are counted. Checking error rate")
+
+	// check error rate
+	var err_rate float64
+	errors := processing_results["errors"]
+	processed := processing_results["processed"]
+	if processed != 0 {
+		err_rate = float64(errors) / float64(processed)
+	} else {
+		err_rate = 1.0
+	}
+	if err_rate >= *opts.Err_rate {
+		log.Errorf(
+			"High error rate (%.2f > %v). Failed load",
+			err_rate,
+			*opts.Err_rate,
+		)
+	} else {
+		log.Infof(
+			"Successful load. Total processed: %d; Total errors: %d",
+			processed,
+			errors,
+		)
+	}
+
 	for _, f := range files {
 
-		// initializing chans
-		jobs := make(chan *Job, 100)        // Buffered channel
-		errs := make(chan *Job, 100)        // Buffered channel
-		result := make(chan map[string]int) // Unbuffered channel
-
-		// starting consumer goroutine
-		for i := 0; i < *opts.Workers; i++ {
-			wg.Add(1)
-			go consume(jobs, errs)
-		}
-
-		// starting analyzer goroutine
-		go analyze(errs, result)
-
-		// opening and un-gunzipping file
 		file_path := fmt.Sprintf("%s/%s", dir, f.Name())
-		fd, err := os.Open(file_path)
-		if err != nil {
-			log.Error(fmt.Sprintf("Cannot open file %s. Error: %s", f.Name(), err))
-		}
-
-		fz, err := gzip.NewReader(fd)
-		if err != nil {
-			log.Error(fmt.Sprintf("Cannot gunzip file %s. Error: %s", f.Name(), err))
-		}
-
-		// iterating over each string in file
-		scanner := bufio.NewScanner(fz)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			appsinstalled, err := parseAppinstalled(line)
-			if err != nil {
-				log.Debug(err)
-				errs <- &Job{Err: err}
-			} else {
-				address := opts.Device_memc[appsinstalled.Dev_type]
-				memc := memc_pool[appsinstalled.Dev_type]
-
-				// scheduling Job
-				jobs <- &Job{
-					Appsinstalled: appsinstalled,
-					Memc:          memc,
-					Address:       address,
-					Dry:           *opts.Dry,
-					Err:           nil,
-				}
-			}
-		}
-
-		close(jobs)
-		log.Info(fmt.Sprintf("Processing file %s ...", f.Name()))
-		wg.Wait()
-
-		close(errs)
-		log.Debug(fmt.Sprintf(
-			"All jobs for %s are scheduled, waiting for analyzer", f.Name()))
-		results := <-result
-		close(result)
-
-		log.Debug(fmt.Sprintf("All results for %s are analyzed", f.Name()))
-
-		// making final calculations
-		var err_rate float64
-		errors := results["errors"]
-		processed := results["processed"]
-		if processed != 0 {
-			err_rate = float64(errors) / float64(processed)
-		} else {
-			err_rate = 1.0
-		}
-		if err_rate >= *opts.Err_rate {
-			log.Error(fmt.Sprintf(
-				"High error rate (%.2f > %v). Failed load", err_rate, *opts.Err_rate))
-		} else {
-			log.Info(
-				fmt.Sprintf(
-					"Successful load %s. Total processed: %d; Total errors: %d",
-					f.Name(),
-					processed,
-					errors,
-				))
-		}
-		fz.Close()
-		fd.Close()
 		if *opts.Rename != false {
 			if err := dotRenameFile(file_path); err == nil {
 				log.Info(fmt.Sprintf("File %s renamed", f.Name()))
@@ -246,9 +268,6 @@ func insertAppsinstalled(
 // set data (key/value pair) into memcache.Client
 // if the Client it is not responding try to reconnect in random intervals
 func setReconnect(memc *memcache.Client, address string, data memcache.Item) error {
-	ctx.Value(address)
-	sem.Acquire(ctx, 1)
-	defer sem.Release(1)
 	if err := memc.Ping(); err != nil {
 		r := rand.New(rand.NewSource(42))
 		for i := 0; i < 3; i++ {
