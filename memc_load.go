@@ -6,10 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
-	"io/ioutil"
 	"math/rand"
 	"os"
-	"regexp"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -290,14 +289,14 @@ func parseAppinstalled(line string) (AppsInstalled, error) {
 	line = strings.TrimSpace(line)
 	prts := strings.Split(line, "\t")
 	if len(prts) != 5 {
-		log.Info("Cannot parse line: %s", line)
+		log.Infof("Cannot parse line: %s", line)
 		return AppsInstalled{}, fmt.Errorf("Cannot parse line: %s", line)
 	}
 	dev_type, dev_id := prts[0], prts[1]
 	lat, errlat := strconv.ParseFloat(prts[2], 2)
 	lon, errlon := strconv.ParseFloat(prts[3], 2)
 	if errlat != nil || errlon != nil {
-		log.Info("Cannot parse geocoords: %s", line)
+		log.Infof("Cannot parse geocoords: %s", line)
 		return AppsInstalled{}, fmt.Errorf("Cannot parse geocoords: %s", line)
 	}
 	raw_apps := strings.Split(prts[4], ",")
@@ -310,7 +309,7 @@ func parseAppinstalled(line string) (AppsInstalled, error) {
 		}
 	}
 	if len(apps) == 0 {
-		log.Info("Cannot parse apps: %s", line)
+		log.Infof("Cannot parse apps: %s", line)
 		return AppsInstalled{}, fmt.Errorf("Cannot parse apps: %s", line)
 	}
 	return AppsInstalled{dev_type, dev_id, lat, lon, apps}, nil
@@ -331,29 +330,30 @@ func getMemcPool(device_memc map[string]string) map[string]*memcache.Client {
 // 	Usage:
 // 		files, err = getFiles("/misc/tarz/.*.tar.gz")
 func getFiles(pattern string) ([]fs.FileInfo, string, error) {
-	s := strings.Split(pattern, "/")
-	file_pattern := s[len(s)-1]
+	dir, file_pattern := filepath.Split(pattern)
+	fsys := os.DirFS(dir)
 	if file_pattern == "" {
-		log.Warning(
+		log.Warningf(
 			"File pattern is a bare directory without actual pattern: ", pattern)
 		log.Warning("All files in dir would be processed")
 	}
-	dir := strings.Join(s[:len(s)-1], "/")
+
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		log.Errorf("Bad pattern %s", pattern)
+	}
 
 	var matched_files []fs.FileInfo
-	var validFile = regexp.MustCompile(file_pattern)
 
-	files, err := ioutil.ReadDir(dir)
-	if err != nil {
-		log.Error(err)
-		return matched_files, dir, err
-	}
 	for _, f := range files {
-		// list only files matching pattern, check out any folders
-		if validFile.MatchString(f.Name()) &&
-			!f.IsDir() &&
-			!strings.HasPrefix(f.Name(), ".") {
-			matched_files = append(matched_files, f)
+		filebase := filepath.Base(f)
+		if !strings.HasPrefix(filebase, ".") {
+			finfo, err := fs.Stat(fsys, filebase)
+			if err != nil {
+				log.Errorf("Cannot get fileinfo from %s. Error: %s", filebase, err)
+				os.Exit(1)
+			}
+			matched_files = append(matched_files, finfo)
 		}
 	}
 
@@ -392,7 +392,7 @@ func getDefaultPattern() string {
 	if default_dir == "" {
 		default_dir = "."
 	}
-	default_pattern := fmt.Sprintf("%s/.*.tsv.gz", default_dir)
+	default_pattern := fmt.Sprintf("%s/*.tsv.gz", default_dir)
 	return default_pattern
 }
 
